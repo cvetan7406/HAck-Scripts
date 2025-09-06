@@ -4,13 +4,13 @@ set -euo pipefail
 # ---- Config ----
 INTERNET_IF="wlan0"      # uplink that's already online
 AP_IF="wlan1"            # interface that will host the AP
-SSID="A1_EC8C"           # network name
+SSID="MyFlex Twins"           # network name
 CHANNEL="6"
 COUNTRY="BG"
 
 GATEWAY_IP="10.0.0.1"
 DHCP_START="10.0.0.10"
-DHCP_END="10.0.0.50"
+DHCP_END="10.0.0.254"
 
 RUNTIME="/tmp/lab_open_ap"
 HOSTAPD_CONF="$RUNTIME/hostapd.conf"
