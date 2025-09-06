@@ -32,6 +32,7 @@ print_help() {
 Usage:
   sudo $SCRIPT_NAME start
   sudo $SCRIPT_NAME stop
+  sudo $SCRIPT_NAME deauth [MAC] [count]
   sudo $SCRIPT_NAME help
   sudo $SCRIPT_NAME -h | --help
 
@@ -39,6 +40,7 @@ Description:
   Brings up a Wi-Fi AP on \$AP_IF and NATs traffic out via \$INTERNET_IF.
   Runs hostapd + dnsmasq and starts bettercap packet capture (pcap in: $BETTERCAP_PCAP_DIR).
   On 'start' you'll be asked whether to secure the AP with WPA2-PSK.
+  The 'deauth' command can disconnect clients from the AP (for testing purposes).
 
 Current defaults:
   INTERNET_IF=$INTERNET_IF
@@ -59,10 +61,15 @@ Files/Logs:
 Examples:
   sudo $SCRIPT_NAME start
   sudo $SCRIPT_NAME stop
+  sudo $SCRIPT_NAME deauth                # Interactive mode
+  sudo $SCRIPT_NAME deauth FF:FF:FF:FF:FF:FF  # Deauth all clients
+  sudo $SCRIPT_NAME deauth 00:11:22:33:44:55 10  # Deauth specific client with 10 packets
 
 Notes:
   - Requires: hostapd, dnsmasq, iptables, ip, sysctl, bettercap
   - If NetworkManager manages \$AP_IF, the script sets it unmanaged during runtime.
+  - The deauth function is for testing/educational purposes only.
+    Use responsibly and only on networks you own or have permission to test.
 EOF
 }
 
@@ -185,6 +192,61 @@ stop_bettercap() {
   pkill -f "^bettercap .* -iface $AP_IF" 2>/dev/null || true
 }
 
+deauth_clients() {
+  local target_mac="${1:-}"
+  local deauth_count="${2:-5}"
+  
+  # Validate the AP is running
+  if ! pgrep hostapd >/dev/null; then
+    echo "Error: Access Point is not running. Start it first with: sudo $SCRIPT_NAME start"
+    exit 1
+  fi
+  
+  # If no target specified, ask for one or offer broadcast option
+  if [[ -z "$target_mac" ]]; then
+    echo "Connected clients:"
+    ip neigh show dev "$AP_IF" | grep -v FAILED
+    
+    echo ""
+    echo "Options:"
+    echo "  1. Deauth all clients (broadcast)"
+    echo "  2. Specify a client MAC address"
+    echo "  q. Quit"
+    
+    read -r -p "Selection [1/2/q]: " selection
+    
+    case "$selection" in
+      1)
+        target_mac="FF:FF:FF:FF:FF:FF"  # Broadcast
+        echo "→ Targeting all clients (broadcast deauth)"
+        ;;
+      2)
+        read -r -p "Enter client MAC address: " target_mac
+        if ! [[ "$target_mac" =~ ^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$ ]]; then
+          echo "Invalid MAC address format. Expected format: XX:XX:XX:XX:XX:XX"
+          exit 1
+        fi
+        echo "→ Targeting specific client: $target_mac"
+        ;;
+      q|Q)
+        echo "Deauth canceled."
+        exit 0
+        ;;
+      *)
+        echo "Invalid selection."
+        exit 1
+        ;;
+    esac
+  fi
+  
+  echo "Sending $deauth_count deauth packets to $target_mac..."
+  
+  # Use bettercap for deauth
+  bettercap -iface "$AP_IF" -no-colors -silent -eval "set wifi.interface $AP_IF; wifi.deauth $target_mac $deauth_count"
+  
+  echo "Deauthentication complete."
+}
+
 start_ap() {
   rfkill unblock all || true
   if command -v nmcli >/dev/null 2>&1; then nmcli dev set "$AP_IF" managed no || true; fi
@@ -261,8 +323,13 @@ case "${1:-}" in
     ensure_root
     stop_ap
     ;;
+  deauth)
+    ensure_root
+    check_bins
+    deauth_clients "${2:-}" "${3:-5}"
+    ;;
   *)
-    echo "Usage: sudo $SCRIPT_NAME {start|stop|help}"
+    echo "Usage: sudo $SCRIPT_NAME {start|stop|deauth|help}"
     echo "Try:   sudo $SCRIPT_NAME --help"
     exit 1
     ;;
