@@ -327,6 +327,8 @@ deauth_clients() {
 }
 
 scan_networks() {
+  local scan_duration="${1:-45}"  # Default 45 seconds or user-specified
+  
   echo "Scanning for wireless networks..."
   mkdir -p "$RUNTIME"
   
@@ -334,20 +336,78 @@ scan_networks() {
   pkill -f "^bettercap" 2>/dev/null || true
   
   # Start bettercap in scan mode
-  echo "Starting scan on $ATTACK_IF (this will take about 20 seconds)"
+  echo "Starting scan on $ATTACK_IF (this may take up to $scan_duration seconds)"
+  echo "WiFi scanning requires checking multiple channels sequentially, please be patient..."
   
   # Clear previous scan results
   rm -f "$SCAN_RESULTS"
+  rm -f "$RUNTIME/networks_found.txt"
   
-  # Use bettercap to scan networks
-  bettercap -iface "$ATTACK_IF" -no-colors -eval "
-    set wifi.interface $ATTACK_IF
-    wifi.recon on
-    sleep 20
-    wifi.show
-    wifi.recon off
-    quit
-  " | tee "$SCAN_RESULTS"
+  # Create a temporary script file for bettercap
+  local bettercap_script="$RUNTIME/scan_script.cap"
+  cat > "$bettercap_script" <<EOF
+set wifi.interface $ATTACK_IF
+wifi.recon on
+sleep $scan_duration
+wifi.show
+wifi.recon off
+quit
+EOF
+
+  # Run bettercap with explicit script file and redirect to file
+  bettercap -iface "$ATTACK_IF" -no-colors -silent -script "$bettercap_script" > "$SCAN_RESULTS" 2>&1 &
+  local pid=$!
+  
+  # Show progress bar
+  local i=0
+  echo -n "Scanning: "
+  while [ $i -le $scan_duration ] && kill -0 $pid 2>/dev/null; do
+    # Print progress indicator
+    printf "\rScanning progress: [%-50s] %d%%" "$(printf '█%.0s' $(seq 1 $((i*50/scan_duration))))" $((i*100/scan_duration))
+    sleep 1
+    i=$((i+1))
+    
+    # If we've exceeded the timeout by 50%, force kill
+    if [ $i -gt $((scan_duration*3/2)) ]; then
+      echo -e "\nScan taking too long, terminating..."
+      kill -9 $pid 2>/dev/null || true
+      break
+    fi
+  done
+  
+  # Wait for bettercap to complete or be killed
+  wait $pid 2>/dev/null || true
+  
+  # Clean up the script file
+  rm -f "$bettercap_script"
+  
+  # Clear progress line
+  printf "\r%-80s\r" " "
+  
+  # Extract networks into a clean format
+  if [ -f "$SCAN_RESULTS" ]; then
+    # Filter and extract networks
+    grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" |
+      grep -v "<hidden>" > "$RUNTIME/networks_found.txt" || true
+      
+    # Check if we found any networks
+    if [ -s "$RUNTIME/networks_found.txt" ]; then
+      local network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+      echo "Scan completed. Found $network_count networks."
+      
+      # Format and display the results
+      echo ""
+      echo "Available Networks:"
+      echo "-----------------"
+      cat "$RUNTIME/networks_found.txt" |
+        awk '{printf "%3d) %s %s (%s) Ch:%s Enc:%s\n", NR, $1, $3, $5, $4, $6}' |
+        sed 's/"//g'
+    else
+      echo "Scan completed. No networks found."
+    fi
+  else
+    echo "Scan failed to produce results."
+  fi
   
   # Filter and display results in a cleaner format
   echo ""
@@ -365,11 +425,32 @@ scan_networks() {
 }
 
 select_target_network() {
-  local network_count=$(grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" | grep -v "<hidden>" | wc -l)
+  # Count networks found
+  local network_count=0
+  if [ -f "$RUNTIME/networks_found.txt" ]; then
+    network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+  fi
   
   if [ "$network_count" -eq 0 ]; then
-    echo "No networks found. Please retry the scan."
-    return 1
+    echo "No networks found. Would you like to try a longer scan?"
+    read -r -p "Scan duration in seconds [60]: " longer_duration
+    longer_duration="${longer_duration:-60}"
+    
+    if [[ "$longer_duration" =~ ^[0-9]+$ ]]; then
+      scan_networks "$longer_duration"
+      # Recount networks
+      if [ -f "$RUNTIME/networks_found.txt" ]; then
+        network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+      fi
+      
+      if [ "$network_count" -eq 0 ]; then
+        echo "Still no networks found. Please check your wireless adapter."
+        return 1
+      fi
+    else
+      echo "Invalid duration. Please retry the scan."
+      return 1
+    fi
   fi
   
   # Ask user to select a network
@@ -390,7 +471,7 @@ select_target_network() {
   done
   
   # Extract target information
-  local line=$(grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" | grep -v "<hidden>" | sed -n "${selection}p")
+  local line=$(sed -n "${selection}p" "$RUNTIME/networks_found.txt")
   TARGET_BSSID=$(echo "$line" | awk '{print $1}')
   TARGET_SSID=$(echo "$line" | awk '{print $3}' | sed 's/"//g')
   TARGET_CHANNEL=$(echo "$line" | awk '{print $4}')
@@ -608,8 +689,18 @@ start_attack_workflow() {
     ip link set "$ATTACK_IF" up
   fi
   
+  # Ask for scan duration
+  read -r -p "WiFi scan duration in seconds [45]: " scan_time
+  scan_time="${scan_time:-45}"
+  
+  # Validate input is a number
+  if ! [[ "$scan_time" =~ ^[0-9]+$ ]]; then
+    echo "Invalid duration. Using default of 45 seconds."
+    scan_time=45
+  fi
+  
   # Scan for networks
-  scan_networks
+  scan_networks "$scan_time"
   
   # Let user select a target
   select_target_network
