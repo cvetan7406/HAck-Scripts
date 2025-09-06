@@ -4,7 +4,7 @@ set -euo pipefail
 # ---- Config ----
 INTERNET_IF="wlan0"      # uplink that's already online
 AP_IF="wlan1"            # interface that will host the AP
-SSID="MyFlex Twins"           # network name
+SSID="WiFiAP"            # default network name (dynamically set in evil twin mode)
 CHANNEL="6"
 COUNTRY="BG"
 
@@ -545,10 +545,12 @@ attack_menu() {
       
       # Temporarily override global variables for AP setup
       AP_IF="$ATTACK_IF"
-      SSID="$twin_ssid"
+      SSID="$twin_ssid"  # Dynamic SSID based on target network
       CHANNEL="$twin_channel"
       SECURITY_MODE="$twin_security"
       PASSPHRASE="$twin_passphrase"
+      
+      echo "Creating evil twin of '$TARGET_SSID' with SSID: '$SSID'"
       
       # Start AP
       write_confs
