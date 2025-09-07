@@ -409,17 +409,6 @@ EOF
     echo "Scan failed to produce results."
   fi
   
-  # Filter and display results in a cleaner format
-  echo ""
-  echo "Available Networks:"
-  echo "-----------------"
-  
-  # Extract BSSID, SSID, RSSI and Encryption
-  grep -E "^[a-fA-F0-9]{2}:" "$SCAN_RESULTS" |
-    grep -v "<hidden>" |
-    awk '{printf "%3d) %s %s (%s) Ch:%s Enc:%s\n", NR, $1, $3, $5, $4, $6}' |
-    sed 's/"//g'
-  
   # Return success
   return 0
 }
@@ -430,27 +419,137 @@ select_target_network() {
   if [ -f "$RUNTIME/networks_found.txt" ]; then
     network_count=$(wc -l < "$RUNTIME/networks_found.txt")
   fi
-  
+
+  # Debug output if no networks found
   if [ "$network_count" -eq 0 ]; then
-    echo "No networks found. Would you like to try a longer scan?"
-    read -r -p "Scan duration in seconds [60]: " longer_duration
-    longer_duration="${longer_duration:-60}"
-    
-    if [[ "$longer_duration" =~ ^[0-9]+$ ]]; then
-      scan_networks "$longer_duration"
-      # Recount networks
-      if [ -f "$RUNTIME/networks_found.txt" ]; then
-        network_count=$(wc -l < "$RUNTIME/networks_found.txt")
-      fi
-      
-      if [ "$network_count" -eq 0 ]; then
-        echo "Still no networks found. Please check your wireless adapter."
-        return 1
-      fi
+    echo "Diagnostic information:"
+    echo "1. Interface status:"
+    iwconfig "$ATTACK_IF" 2>&1
+    echo ""
+    echo "2. Available wireless interfaces:"
+    iwconfig 2>&1 | grep -E '^[a-z0-9]'
+    echo ""
+    echo "3. Scan results file content preview:"
+    if [ -f "$SCAN_RESULTS" ]; then
+      head -n 20 "$SCAN_RESULTS" 2>&1
     else
-      echo "Invalid duration. Please retry the scan."
-      return 1
+      echo "No scan results file found."
     fi
+    
+    echo ""
+    echo "No networks found. What would you like to do?"
+    echo "1. Try a longer scan"
+    echo "2. Try a different interface"
+    echo "3. Try a different scanning method"
+    echo "4. Quit"
+    read -r -p "Selection [1]: " retry_option
+    retry_option="${retry_option:-1}"
+    
+    case "$retry_option" in
+      1)
+        echo "Trying a longer scan..."
+        read -r -p "Scan duration in seconds [90]: " longer_duration
+        longer_duration="${longer_duration:-90}"
+        
+        if [[ "$longer_duration" =~ ^[0-9]+$ ]]; then
+          scan_networks "$longer_duration"
+          # Recount networks
+          if [ -f "$RUNTIME/networks_found.txt" ]; then
+            network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+          fi
+          
+          if [ "$network_count" -eq 0 ]; then
+            echo "Still no networks found."
+            echo "Try checking if your wireless adapter supports monitor mode and packet injection."
+            echo "You might need to use a different adapter or external antenna."
+            return 1
+          fi
+        else
+          echo "Invalid duration. Please retry the scan."
+          return 1
+        fi
+        ;;
+      
+      2)
+        echo "Available wireless interfaces:"
+        iwconfig 2>/dev/null | grep -E '^[a-z0-9]' | cut -d' ' -f1
+        read -r -p "Enter interface to use: " alt_if
+        
+        if [ -n "$alt_if" ] && iwconfig "$alt_if" >/dev/null 2>&1; then
+          ATTACK_IF="$alt_if"
+          echo "Switched to interface $ATTACK_IF"
+          # Restart attack workflow with new interface
+          echo "Setting new interface to monitor mode..."
+          ip link set "$ATTACK_IF" down 2>/dev/null || true
+          iwconfig "$ATTACK_IF" mode monitor 2>/dev/null || iw dev "$ATTACK_IF" set type monitor 2>/dev/null || true
+          ip link set "$ATTACK_IF" up 2>/dev/null || true
+          scan_networks 60
+          # Recount networks
+          if [ -f "$RUNTIME/networks_found.txt" ]; then
+            network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+          fi
+        else
+          echo "Invalid interface. Exiting."
+          return 1
+        fi
+        ;;
+      
+      3)
+        if command -v airodump-ng >/dev/null 2>&1; then
+          echo "Trying scan with airodump-ng..."
+          # Prepare for airodump scan
+          mkdir -p "$RUNTIME"
+          # Run airodump-ng in background and capture output
+          airodump-ng --output-format csv -w "$RUNTIME/airodump" "$ATTACK_IF" >/dev/null 2>&1 &
+          airodump_pid=$!
+          
+          # Show countdown
+          echo "Scanning for 30 seconds..."
+          for (( i=30; i>0; i-- )); do
+            printf "\rTime remaining: %d seconds " $i
+            sleep 1
+          done
+          
+          # Kill airodump-ng
+          kill $airodump_pid 2>/dev/null
+          
+          # Process the CSV output
+          if [ -f "$RUNTIME/airodump-01.csv" ]; then
+            # Skip first line, get APs, remove commas in SSIDs
+            tail -n +2 "$RUNTIME/airodump-01.csv" |
+              grep -v "^$" |
+              awk -F, '{gsub(/,/,"_",$14); print $1","$4","$14","$6}' |
+              head -n -1 > "$RUNTIME/networks_found.txt"
+            
+            # Recount networks
+            if [ -s "$RUNTIME/networks_found.txt" ]; then
+              network_count=$(wc -l < "$RUNTIME/networks_found.txt")
+              echo -e "\nScan completed. Found $network_count networks."
+            else
+              echo -e "\nScan completed. No networks found with airodump-ng either."
+              echo "Your wireless adapter may not support the required features."
+              return 1
+            fi
+          else
+            echo -e "\nAirodump scan failed."
+            return 1
+          fi
+        else
+          echo "airodump-ng not found. Cannot try alternative scanning method."
+          return 1
+        fi
+        ;;
+      
+      4|q|Q)
+        echo "Exiting."
+        return 1
+        ;;
+      
+      *)
+        echo "Invalid option. Exiting."
+        return 1
+        ;;
+    esac
   fi
   
   # Ask user to select a network
@@ -681,12 +780,59 @@ attack_menu() {
 }
 
 start_attack_workflow() {
-  # Check for wireless interface in monitor mode
+  # Check wireless interface availability
+  if ! iwconfig "$ATTACK_IF" >/dev/null 2>&1; then
+    echo "Error: Interface $ATTACK_IF not found."
+    echo "Available wireless interfaces:"
+    iwconfig 2>/dev/null | grep -E '^[a-z0-9]' | cut -d' ' -f1
+    read -r -p "Enter interface name to use: " new_if
+    if [ -n "$new_if" ] && iwconfig "$new_if" >/dev/null 2>&1; then
+      ATTACK_IF="$new_if"
+    else
+      echo "Invalid interface. Exiting."
+      exit 1
+    fi
+  fi
+
+  # Show interface details before proceeding
+  echo "Interface info for $ATTACK_IF:"
+  iwconfig "$ATTACK_IF" | grep -v "^\s"
+  
+  # Ensure interface is up
+  ip link set "$ATTACK_IF" up 2>/dev/null || true
+  
+  # Check for monitor mode support
+  if ! iw list 2>/dev/null | grep -q "monitor"; then
+    echo "Warning: Monitor mode may not be supported on this device."
+    echo "Scanning may not work correctly."
+  fi
+  
+  # Try to set monitor mode
+  echo "Setting $ATTACK_IF to monitor mode..."
+  ip link set "$ATTACK_IF" down
+  iwconfig "$ATTACK_IF" mode monitor 2>/dev/null || iw dev "$ATTACK_IF" set type monitor 2>/dev/null || true
+  ip link set "$ATTACK_IF" up
+  
+  # Verify monitor mode
   if ! iwconfig "$ATTACK_IF" 2>/dev/null | grep -q "Mode:Monitor"; then
-    echo "Setting $ATTACK_IF to monitor mode..."
-    ip link set "$ATTACK_IF" down
-    iwconfig "$ATTACK_IF" mode monitor
-    ip link set "$ATTACK_IF" up
+    echo "Warning: Failed to set monitor mode. Trying alternative method..."
+    # Try alternative method with airmon-ng if available
+    if command -v airmon-ng >/dev/null 2>&1; then
+      airmon-ng start "$ATTACK_IF" >/dev/null 2>&1
+      # Check if monitor interface was created
+      mon_if=$(iwconfig 2>/dev/null | grep "Mode:Monitor" | head -n1 | cut -d' ' -f1)
+      if [ -n "$mon_if" ]; then
+        echo "Successfully created monitor interface: $mon_if"
+        ATTACK_IF="$mon_if"
+      fi
+    fi
+  fi
+  
+  # Confirm monitor mode
+  if iwconfig "$ATTACK_IF" 2>/dev/null | grep -q "Mode:Monitor"; then
+    echo "Successfully set $ATTACK_IF to monitor mode."
+  else
+    echo "Warning: Could not set monitor mode. Scanning may be limited."
   fi
   
   # Ask for scan duration
